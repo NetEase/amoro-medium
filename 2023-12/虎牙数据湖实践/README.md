@@ -51,6 +51,93 @@ alter table iceberg.xxx.xxx set tblproperties (
 
 # 离线链路时效提升
 
-# 遇到问题与解决
+1. 业务背景
+
+虎牙的批处理链路是基于 Hive + Spark 的方案，采用的是小时级的分区以提升离线计算的实效性，然而这套方案还是存在一些问题：
+
+1. 对 Hive Meta Database 压力大: 由于是小时级分区，导致分区数量非常庞大，在分区数比较多的查询中对 MySQL 服务的压力很大，对系统整体的可用性会带来较大的风险。
+2. 没有 File Skippping 能力: Hive 只能做到分区级别的文件过滤，实际查询中还是会读取很多不需要的文件，对整体计算任务的性能影响比较大。
+3. 任务调度困难: 为了提高计算的实效性，我们期望数据到达后立即调度，但是 Hive 目前的元数据很难支持判定一个分区的数据是否全部到达。
+4. 实效性达不到要求: 由于调度触发以及计算性能的问题，即使使用了小时级别的分区，后续的分析任务执行完成时，延迟已经超过1小时很久了。
+
+上述问题的核心还是实效性，虎牙通过将 ODS/DWD 层从 Hive 表替换为 Iceberg 表以解决上述问题。在替换为 Iceberg 表以后，虎牙将任务调度的周期从1小时一次改为了10分钟一次。
+
+由于 Iceberg 有很强的 File Skipping 能力，而且通过时间过滤后，每次参与计算的文件数量大大减少了，这不仅提高了计算效率，并且由于调度周期的提升，使得最终产出数据的实效性得到了提升。
+
+另外通过对 Flink Iceberg Sink 进行改造，使得每次提交时，将当前数据的 watermark 记录到 Snapshot sammary 中.
+
+![Flink Watermark](./image-flink-watermark.png)
+
+这样任务调度系统即可依据 SQL 查询 Iceberg 元数据表决定是否开始进行计算任务的调度。
+
+```sql
+SELECT 
+assert_true(date_format(from_unixtime(max(summary['flink.watermark'])/1000),'yyyy-MM-dd HH:mm:ss') > 'xxx')
+FROM iceberg.xxx.xxx.snapshots;
+```
+ 
+
+# Iceberg 使用过程中的优化
+
+**1. Flink 写入过程中数据倾斜问题处理**
+
+在以上两个使用 Iceberg 的场景中，均使用 Flink 完成数据入湖。在使用 Flink 写入 Iceberg 的过程中，由于源端数据分布问题，导致出数据倾斜。
+
+比如在表中定义三个分区字段 `day` `hour` 和 `type`， 通过 Flink 实时写入 Iceberg ， Iceberg 提供 `distribution-mode` 为 `none` 或者 `hash`，如果是 `none` 的话在`flink`到 `writer` 是散发过去的，每个 `writer` 都会至少生成 `type` 总类型数量文件，如果 `type` 一共有50种，写入并行度为200，那么在一次checkpoint中至少生成 50 * 200 个文件，这会导致产生非常多的 io 链接，commit的时候也不稳定。如果使用`hash`，可以减少文件的生成，但是如果某一个 `type` 的值特别大，就会导致这个`type` 值全部发往一个writer，这样就会导致数据倾斜,在写入的时候吞吐量就不够了，而且会有严重的反压。
+
+
+虎牙的解决方案是通过 在 `Flink writer` 算子之前添加一个统计算子以及 `Custom Partition` 实现的。 
+
+
+通过对 `flink RowData` 做一层包装, 在数据中加入自定义的分区号：
+
+```java
+public class RowDataWrap implements RowData {
+  private RowData rowData;
+  private int partition;
+
+  public RowData getRowData() {
+    return rowData;
+  }
+
+  public RowDataWrap setRowData(RowData rowData) {
+    this.rowData = rowData;
+    return this;
+  }
+
+  public int getPartition() {
+    return partition;
+  }
+
+  public RowDataWrap setPartition(int partition) {
+    this.partition = partition;
+    return this;
+  }
+```
+
+在 `Flink writer` 算子之前添加一个统计算子用于收集本次 `checkpoint` 中各个 `type` 类型所占此区间内的比例, 在 checkpoint 之后作为算子状态存储，比如:
+
+
+```
+type_a:12%, type_b:30%, type_c:0.5%.....
+```
+
+
+然后在下一个checkpoint区间，再计算出行数据需要发往的 `partition num`，比如上述如果有200个写入并行度，那么 `type_a` 的数据就会被发送到 `0~23` 号写入 partition 写入。
+
+
+![Shuffle-Writer](./image-shuflle-writer.png)
+
+最终能在既能保证写入效率的情况下，文件数量也能控制在一个合理值。
+
+
+![Shuffle-Result](./image-shuffle-result.png)
+
+如图，每个写入task的写入数据量都几乎相等，这解决了日志入湖场景下的大难题，有了type分区，下游也能更好的利用 `iceberg` 的 `file skipping` 能力.
+
+当然 Iceberg 社区也有一个 project 在跟进这块 ，有兴趣也可以关注一下： <https://github.com/apache/iceberg/projects/27>
+
+####
+
 
 # 未来规划
