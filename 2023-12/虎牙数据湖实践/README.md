@@ -116,7 +116,9 @@ public class RowDataWrap implements RowData {
   }
 
   public int getPartition() {
-    return partition;由于虎牙接入 Iceberg 表的场景大部分都是实时或准实时场景，这种场景下 Flink 写入 Iceberg 表会产生大量的小文件。文件的碎片化对查询性能产生了较大的影响，因此需要定期对 Iceberg 表进行重写以合并小文件。
+    return partition;由于虎牙接入 Iceberg 表的场景大部分都是实时或准实时场景，这种场景下 Flink 写入 Iceberg 表会产生大量的小文件。文件的碎片化对查询性能产生了较大的影响，因此需要定期对 Iceberg 表进行重写以合并# 摘要
+
+本文主要介绍了虎牙基于 Apache Iceberg 在数据湖构建方面的实践经验。小文件。
   }
 
   public RowDataWrap setPartition(int partition) {
