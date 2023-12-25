@@ -1,12 +1,17 @@
+# 作者介绍
+
+胡源峰: [[一段自我介绍]]
+
 # 摘要
 
-本文主要介绍了虎牙基于 Apache Iceberg 在数据湖构建方面的实践经验。
+本文主要介绍了虎牙基于 Apache Iceberg 在实时数据湖构建方面的实践经验。
 
 [[一段话介绍虎牙情况]]
 
-本文将主要介绍虎牙基于 Apache Iceberg 在实时报表/Adhoc查询和离线链路实效性提升两个场景下的实践。
+本文将主要介绍虎牙基于 Apache Iceberg 在实时报分析和离线链路实效性提升两个场景下的实践。
 
-# 实时报表/Adhoc查询场景
+
+# 实时分析场景
 
   
 1. **基于 Apache Iceberg 构建实时分析数仓的背景**
@@ -39,8 +44,7 @@
 由于 Alluxio 集群只在查询加速时才开启，所以并没有使用 Hadoop 集成 Alluxio 的方式使用，对于数据入湖过程中，仍然以 `hdfs://` 的文件路径写入数据文件。为了可以根据需求动态的选择 Alluxio 查询加速，虎牙在 Trino 的 Iceberg FileIO 进行了封装，通过表上的参数，在读取文件时将文件路径重定向到 Alluxio 集群。
 
 ```sql
-alter table iceberg.xxx.xxx set tblproperties (
-    'read.datafile.alluxio.enable' = 'true');
+alter table iceberg.xxx.xxx set tblproperties ('read.datafile.alluxio.enable' = 'true');
 ```
 
 这样 Trino 引擎就可以根据需要选择访问 Hadoop 或 Alluxio 集群访问数据文件了。
@@ -59,16 +63,18 @@ Amoro 采用了基于文件统计信息触发的合并任务调度，这使得�
 通过以上3种方式对 Iceberg 表查询的进一步优化，几乎得到了和 OLAP 引擎一样的查询体验。
 
 
-# 离线链路时效提升
+# 近实时数据处理场景
 
-1. 业务背景
+**1. 业务背景**
 
-虎牙的批处理链路是基于 Hive + Spark 的方案，采用的是小时级的分区以提升离线计算的实效性，然而这套方案还是存在一些问题：
+虎牙的离线批处理链路是基于 Hive + Spark 的方案，采用的是小时级的分区以提升离线计算的实效性，然而这套方案还是存在一些问题：
 
 1. 对 Hive Meta Database 压力大: 由于是小时级分区，导致分区数量非常庞大，在分区数比较多的查询中对 MySQL 服务的压力很大，对系统整体的可用性会带来较大的风险。
 2. 没有 File Skippping 能力: Hive 只能做到分区级别的文件过滤，实际查询中还是会读取很多不需要的文件，对整体计算任务的性能影响比较大。
 3. 任务调度困难: 为了提高计算的实效性，我们期望数据到达后立即调度，但是 Hive 目前的元数据很难支持判定一个分区的数据是否全部到达。
 4. 实效性达不到要求: 由于调度触发以及计算性能的问题，即使使用了小时级别的分区，后续的分析任务执行完成时，延迟已经超过1小时很久了。
+
+**2. 基于 Watermark 的 Iceberg 近实时调度**
 
 上述问题的核心还是实效性，虎牙通过将 ODS/DWD 层从 Hive 表替换为 Iceberg 表以解决上述问题。在替换为 Iceberg 表以后，虎牙将任务调度的周期从1小时一次改为了10分钟一次。
 
@@ -116,9 +122,7 @@ public class RowDataWrap implements RowData {
   }
 
   public int getPartition() {
-    return partition;由于虎牙接入 Iceberg 表的场景大部分都是实时或准实时场景，这种场景下 Flink 写入 Iceberg 表会产生大量的小文件。文件的碎片化对查询性能产生了较大的影响，因此需要定期对 Iceberg 表进行重写以合并# 摘要
-
-本文主要介绍了虎牙基于 Apache Iceberg 在数据湖构建方面的实践经验。小文件。
+    return partition;
   }
 
   public RowDataWrap setPartition(int partition) {
