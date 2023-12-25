@@ -1,6 +1,6 @@
 # 摘要
 
-本文主要介绍了虎牙基于 Apache Iceberg 以及 Amoro 在数据湖构建方面的实践经验。
+本文主要介绍了虎牙基于 Apache Iceberg 在数据湖构建方面的实践经验。
 
 [[一段话介绍虎牙情况]]
 
@@ -32,7 +32,7 @@
 
 同时改写了 Trino 查询引擎的执行计划，用户查询时会先访问元数据服务，拿到对应的表在 Doris 和 Iceberg 的分析信息，通过物化查询器的重写，将最近一段时间的插件直接命中 Doris ， 对于 Doris 中已经删除的分区会命中到 Iceberg 表上。这样对于近实时的查询可以获得更好的查询性能。
 
-3. **重新 FileIO 进行 alluxio加速**
+3. **重写 FileIO 进行 alluxio 加速**
 
 通过引入 Doris 解决了大部分较近数据的查询响应需求，然而仍然有部分对查询需求要求 Iceberg 表也有较高的查询响应需求。对于这部分表，数据分析平台自己搭建了 Alluxio 集群对查询进行加速。
 
@@ -45,8 +45,18 @@ alter table iceberg.xxx.xxx set tblproperties (
 
 这样 Trino 引擎就可以根据需要选择访问 Hadoop 或 Alluxio 集群访问数据文件了。
 
-通过以上两种方式对 Iceberg 表的查询加速，几乎获得了和 OLAP 引擎接近的查询体验。
 
+4. **引入 Amoro 对 Iceberg 表进行持续优化**
+
+为了保证实效性，虎牙采用的是 Flink 实时写入 Iceberg 表的方案，在这种场景下 Flink 写入 Iceberg 表会产生大量的小文件。文件的碎片化对查询性能产生了较大的影响，因此需要定期对 Iceberg 表进行重写以合并小文件。
+
+最开始虎牙采用的是通过 Spark 定时任务周期性的调度 Iceberg 原生的 `rewrite_data_files` 存储过程实现的，然而当部分业务开始尝试接入 CDC 数据时，这种方案却并不能达到预期的效果。一方面 CDC 场景下 Flink Sink 端会产生大量的 Equality-Delete 文件，引擎端在读取带有 Equality-Delete 文件的表时需要将关联的 Equality-Delete 文件缓存到内存中，如果合并任务没有及时合并导致 Equality-Delete 文件堆积，会对查询端产生非常大的影响，甚至引起引擎端 OOM。 另一方面，CDC 场景下的合并任务调度也更加复杂，在日志场景下，数据只会写入最新的分区，因此合并任务只需要合并最新产生的分区即可，但是在 CDC 场景下，更新可能发生在历史分区，合并任务需要根据文件的写入情况评估哪些分区需要合并，这大大提高了合并任务的维护难度。
+
+基于以上问题，虎牙开始调研是否有成熟的方案可以及时发现碎片文件多的表并且及时地去对这些表进行合并，此时刚好 Amoro 项目开源，虎牙便测试了使用 Amoro 对 Iceberg 表进行优化的场景。
+
+Amoro 采用了基于文件统计信息触发的合并任务调度，这使得相比原来采用 Spark 定时任务做周期性调度，Amoro 的调度周期可以更及时，开销更小。 这不仅仅可以用于解决虎牙 CDC 表治理的问题，对于基于 Iceberg 的日志表同样有很好的优化效果，基本上实现了数据入湖后分钟级延迟的数据合并，大大提高了 OLAP 分析查询效率。
+
+通过以上3种方式对 Iceberg 表查询的进一步优化，几乎得到了和 OLAP 引擎一样的查询体验。
 
 
 # 离线链路时效提升
@@ -106,7 +116,7 @@ public class RowDataWrap implements RowData {
   }
 
   public int getPartition() {
-    return partition;
+    return partition;由于虎牙接入 Iceberg 表的场景大部分都是实时或准实时场景，这种场景下 Flink 写入 Iceberg 表会产生大量的小文件。文件的碎片化对查询性能产生了较大的影响，因此需要定期对 Iceberg 表进行重写以合并小文件。
   }
 
   public RowDataWrap setPartition(int partition) {
@@ -137,7 +147,33 @@ type_a:12%, type_b:30%, type_c:0.5%.....
 
 当然 Iceberg 社区也有一个 project 在跟进这块 ，有兴趣也可以关注一下： <https://github.com/apache/iceberg/projects/27>
 
-####
 
+**2. 基于 Amoro 管理并监控 Iceberg 表**
+
+虎牙是在 Iceberg 实时分析场景下，为解决 Iceberg 表小文件合并问题引入 Amoro 的，然而接入 Amoro 后发现其可以提供不止于 Iceberg 表在线合并的能力。目前 Amoro 已经成为了虎牙 Iceberg 表的在线管理监控平台。
+
+1. Iceberg 表快照自动过期
+
+在 Iceberg 原生提供的能力中，快照的过期需要通过 Spark 任务触发。而 Amoro 集成了快照管理的能力，通过对表上设置 properties 即可自动化的过期历史快照。
+
+2. Iceberg 表孤儿文件治理
+
+在任务写入 Iceberg 过程中，由于提交失败或者 Failover 等原因可能产生一些孤儿文件，这些文件不被访问到但是占据存储空间。在 Iceberg 原生提供的能力中，孤儿文件清理需要通过 Spark 任务触发，而 Amoro 同样集成了孤儿文件治理的能力，只需要设置表上对应的 properties 即可自动发现并删除孤儿文件。
+
+3. Iceberg 表元信息展示以及DDL执行
+
+不同于 Hive 等传统大数据表，Iceberg 表除了列信息外，还有一些额外的元信息比如 Snapshot 记录。并且 Iceberg 表在 Hive 上并不会注册分区信息，因此这些 Iceberg 的元信息无法在一些与 Hive 集成的可视化平台中展示。Amoro 提供了 Iceberg 元信息展示页面，使得虎牙的系统管理者可以通过 Amoro 比较轻松的查看 Iceberg 表的元信息。同时也会使用 Amoro 提供的 Terminal SQL 入口执行一些管理性 DDL。
+
+4. 基于 Amoro 二次开发元数据监控。
+
+由于 Amoro 是基于表的快照信息触发 Optimizing 任务，这使得 Amoro 会持续维护 Iceberg 的快照统计信息。虎牙数据团队基于 Amoro 二次开发了 Iceberg 表的监控告警，在 Amoro 刷新 Iceberg 的元数据后，可以根据自定义的规则触发告警。
+
+目前虎牙线上所有 Iceberg 表均接入了 Amoro, 其中除去离线数据加工链路的统一采用 Spark 进行数据优化外， 所有 Flink 实时分析场景的 Iceberg 表均通过 Amoro 进行持续优化。
 
 # 未来规划
+
+目前虎牙和 Amoro 社区保持着紧密联系，积极参与到 Amoro 社区的多个核心功能开发中。目前正在推进 Amoro 监控告警功能的开发中，会将目前公司内的实践贡献给社区。另外在参与 Amoro 对 Iceberg 表 Tag & Branch 相关功能的推进。
+
+另外虎牙也在探索 Paimon 在 CDC 场景下的应用，并且尝试使用 Amoro 集成管理 Paimon 表，期待未来给大家带来更多实践。
+
+
